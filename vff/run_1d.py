@@ -1,6 +1,8 @@
 import torch
 from torch import optim
 
+from vff.utils.training import training_loop
+
 CUDA_ENABLED = torch.cuda.is_available()
 print(f"Is GPU available? {CUDA_ENABLED}")
 if CUDA_ENABLED:
@@ -12,7 +14,6 @@ print(f"Device {device}")
 import numpy as np
 import matplotlib.pyplot as plt
 
-import tqdm
 import os
 import random
 import pickle
@@ -22,6 +23,7 @@ import warnings
 warnings.simplefilter("ignore", UserWarning)
 
 from utils.plot_utils import plot_losses
+from typing import Iterable
 # Everything here is based on QUIMB and PyTorch
 from tn.mps_circuit import TNModel, qmps_brick, qmps_brick_quasi_1d, create_targets, load_gates
 from tn.data_states import random_product_state, \
@@ -213,6 +215,20 @@ def main(config):
         if PRINT:
             print(f"(double_time) Initial depth = {initial_depth}")
             print(f"(double_time) Max factor = {max_factor}\n")
+    elif training_strategy == 'multiple_times':
+        times = config.get('times')
+        assert isinstance(times, Iterable), f'`times` must be a list an iterable integers, received {type(times)}'
+        assert all(isinstance(t_i, float) for t_i in times)
+        t = times[0]
+        depth = config.get('depth')
+        training_strategy_path = f"{training_strategy}"
+        path_name = f'UNITARY_COMPILATION/{hamiltonian_path}/L_{L}/{training_strategy_path}/' \
+                    f'Nsteps_{num_steps}_{circuit_name}' \
+                    f'{"_translation" if circuit_translation else ""}/' \
+                    f'SEED_{SEED}/t_start_{t:1.3f}/Ns_{num_samples}_{training_state_path}_bd_max_{tebd_max_bond}'
+        if PRINT:
+            print(f"(multiple_times) Depth = {depth}")
+            print(f"(multiple_times) Times = {times}\n")
     elif training_strategy == 'double_space':
         assert circuit_translation, '`double_space` requires translation invariant circuits'
         assert hamiltonian != 'heisenberg_2d', 'Does not work for 2D models yet'
@@ -336,19 +352,7 @@ def main(config):
                     optimizer = optim.Adam(model.parameters(), lr=lr)
                     scheduler = learning_rate_scheduler(optimizer)
 
-                    pbar = tqdm.tqdm(range(num_steps), disable=not PRINT)
-                    previous_loss = torch.inf
-                    for step in pbar:
-                        optimizer.zero_grad()
-                        loss = model()
-                        loss.backward()
-                        optimizer.step()
-                        scheduler.step()
-                        pbar.set_description(f"Loss={loss} - LR={scheduler.get_last_lr()[0]}")
-                        if step > 100 and torch.abs(previous_loss - loss) < 1e-10:
-                            print("Early stopping loss difference is smaller than 1e-10")
-                            break
-                        previous_loss = loss.clone()
+                    model = training_loop(optimizer, model, scheduler, num_steps, show_progress=PRINT)
 
                     # Save the model state.
                     torch.save(model.state_dict(), save_path_depth_ckpts + "parameters.ckpt")
@@ -563,19 +567,135 @@ def main(config):
                     optimizer = optim.Adam(model.parameters(), lr=lr)
                     scheduler = learning_rate_scheduler(optimizer)
 
-                    pbar = tqdm.tqdm(range(num_steps), disable=not PRINT)
-                    previous_loss = torch.inf
-                    for step in pbar:
-                        optimizer.zero_grad()
-                        loss = model()
-                        loss.backward()
-                        optimizer.step()
-                        scheduler.step()
-                        pbar.set_description(f"Loss={loss} - LR={scheduler.get_last_lr()[0]}")
-                        if step > 100 and torch.abs(previous_loss - loss) < 1e-10:
-                            print("Early stopping loss difference is smaller than 1e-10")
-                            break
-                        previous_loss = loss.clone()
+                    model = training_loop(optimizer, model, scheduler, num_steps, show_progress=PRINT)
+
+                    # Save the model state.
+                    torch.save(model.state_dict(), save_path_depth_ckpts + "parameters.ckpt")
+
+                    final_loss = model().cpu().detach().numpy()
+                    np.save(save_path_depth + 'train_loss', final_loss)
+                else:
+                    previous_loss = np.load(save_path_depth + 'train_loss.npy')
+                    print(f"Data for depth {depth} exists, loss = {previous_loss}")
+                if TEST:
+                    if not os.path.exists(save_path_depth + f'test_loss_{test_size}.npy'):
+                        # Create or Load test data
+                        if not os.path.exists(save_path_t_i + 'psi0_test.pickle') or not os.path.exists(
+                                save_path_t_i + 'psit_test.pickle'):
+                            print("Creating test dataset")
+                            psi0_list_test, psit_list_test, tebd_errors = make_data_set(
+                                lambda x: get_training_state(L, x), t_i,
+                                test_size, SEED + 10 ** 6)
+
+                            np.save(save_path_t_i + 'tebd_errors_test', np.array(tebd_errors))
+                            with open(save_path_t_i + 'psi0_test.pickle', 'wb') as file:
+                                pickle.dump(psi0_list_test, file)
+                            with open(save_path_t_i + 'psit_test.pickle', 'wb') as file:
+                                pickle.dump(psit_list_test, file)
+                        else:
+                            with open(save_path_t_i + 'psi0_test.pickle', 'rb') as file:
+                                psi0_list_test = pickle.load(file)
+                            with open(save_path_t_i + 'psit_test.pickle', 'rb') as file:
+                                psit_list_test = pickle.load(file)
+                            tebd_errors = np.load(save_path_t_i + 'tebd_errors_test.npy')
+                            print("Restored test dataset from file")
+                            assert len(psi0_list_test) == test_size
+                            assert len(psit_list_test) == test_size
+                        print(f"TEBD error: {np.mean(tebd_errors)}")
+                        # If we're in the first layer, start with the identity, otherwise, perturb.
+                        if hamiltonian != 'heisenberg_2d':
+                            psi_pqc = qmps_ansatz(L, in_depth=depth, rand=False, val_iden=0.01)
+                        else:
+                            psi_pqc = qmps_ansatz(Lx, Ly, in_depth=depth, rand=False, val_iden=0.01,
+                                                  boundary_condition=bc)
+                        psi, psi_tars = create_targets(L, psi_pqc, psi0_list_test, psit_list_test, device=device)
+                        model = TNModel(psi, psi_tars, translation=circuit_translation, ctg=ctg)
+                        # Load previous parameters,
+                        # strict=false means we don't need the number of parameters to match
+
+                        model.load_state_dict(torch.load(save_path_depth_ckpts + "parameters.ckpt",
+                                                         map_location=torch.device(device)), strict=True)
+                        model.eval()
+                        model.to(device)
+                        test_loss = model().cpu().detach().numpy()
+                        np.save(save_path_depth + f'test_loss_{test_size}', test_loss)
+                    else:
+                        test_loss = np.load(save_path_depth + f'test_loss_{test_size}.npy')
+                    print(f"Test loss for {test_size} samples = {test_loss}")
+        elif training_strategy == 'multiple_times':
+            for i, t_i in enumerate(times):
+                print(f"Training for t={t_i:1.3f}")
+                save_path_t_i = save_path + f't_{t_i:1.3f}/'
+                save_path_t_i_previous = save_path + f't_{times[i-1]:1.3f}/'
+                if not os.path.exists(save_path_t_i):
+                    os.makedirs(save_path_t_i)
+                # Create or Load Train data
+                if not os.path.exists(save_path_t_i + 'psi0.pickle') or not os.path.exists(
+                        save_path_t_i + 'psit.pickle'):
+
+                    print("Creating training data set")
+                    psi0_list_train, psit_list_train, tebd_errors = make_data_set(lambda x: get_training_state(L, x),
+                                                                                  t_i,
+                                                                                  num_samples, SEED)
+
+                    with open(save_path_t_i + 'psi0.pickle', 'wb') as file:
+                        pickle.dump(psi0_list_train, file)
+                    with open(save_path_t_i + 'psit.pickle', 'wb') as file:
+                        pickle.dump(psit_list_train, file)
+                    np.save(save_path_t_i + 'tebd_errors_train', np.array(tebd_errors))
+                else:
+                    with open(save_path_t_i + 'psi0.pickle', 'rb') as file:
+                        psi0_list_train = pickle.load(file)
+                    with open(save_path_t_i + 'psit.pickle', 'rb') as file:
+                        psit_list_train = pickle.load(file)
+                    tebd_errors = np.load(save_path_t_i + 'tebd_errors_train.npy')
+                    print("Restored train dataset from file")
+                    assert len(psi0_list_train) == num_samples
+                    assert len(psit_list_train) == num_samples
+                print(f"TEBD error: {np.mean(tebd_errors)}")
+
+                save_path_depth = save_path_t_i + f"depth_{depth}/"
+                save_path_depth_previous = save_path_t_i_previous + f"depth_{depth}/"
+                save_path_depth_ckpts = save_path_depth + "ckpts/"
+                save_path_depth_ckpts_previous = save_path_depth_previous + "ckpts/"
+                print(f"DEPTH = {depth}")
+
+                if not os.path.exists(save_path_depth + "train_loss.npy"):
+                    if not os.path.exists(save_path_depth_ckpts):
+                        os.makedirs(save_path_depth_ckpts)
+                    # # If we're in the first layer, start with the identity, otherwise, perturb.
+                    if hamiltonian != 'heisenberg_2d':
+                        psi_pqc = qmps_ansatz(L, in_depth=depth, rand=False, val_iden=0.01)
+                    else:
+                        psi_pqc = qmps_ansatz(Lx, Ly, in_depth=depth, rand=False, val_iden=0.01, boundary_condition=bc)
+                    psi, psi_tars = create_targets(L, psi_pqc, psi0_list_train, psit_list_train, device=device)
+                    model = TNModel(psi, psi_tars, translation=circuit_translation, ctg=ctg)
+                    if i > 0:
+                        # Load previous parameters, strict=false means we don't need the number of parameters to match
+                        torch_params = torch.load(save_path_depth_ckpts_previous + "parameters.ckpt",
+                                                  map_location=torch.device(device))
+                        new_torch_params = dict()
+                        for k, v in torch_params.items():
+                            index = int(k.split(".")[-1])
+                            new_torch_params[f"torch_params.{index}"] = v.clone()
+                        model.load_state_dict(new_torch_params, strict=True)
+                    model.eval()
+                    print(f"Start loss = {model.forward():1.12f}")
+                    model.to(device)
+
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            action='ignore',
+                            message='.*trace might not generalize.*',
+                        )
+                        model = torch.jit.trace_module(model, {"forward": []})
+                    print(f"Start loss = {model.forward():1.12f}")
+
+                    lr = learning_rate
+                    optimizer = optim.Adam(model.parameters(), lr=lr)
+                    scheduler = learning_rate_scheduler(optimizer)
+
+                    model = training_loop(optimizer, model, scheduler, num_steps, show_progress=PRINT)
 
                     # Save the model state.
                     torch.save(model.state_dict(), save_path_depth_ckpts + "parameters.ckpt")
@@ -694,19 +814,7 @@ def main(config):
                     optimizer = optim.Adam(model.parameters(), lr=lr)
                     scheduler = learning_rate_scheduler(optimizer)
 
-                    pbar = tqdm.tqdm(range(num_steps), disable=not PRINT)
-                    previous_loss = torch.inf
-                    for step in pbar:
-                        optimizer.zero_grad()
-                        loss = model()
-                        loss.backward()
-                        optimizer.step()
-                        scheduler.step()
-                        pbar.set_description(f"Loss={loss} - LR={scheduler.get_last_lr()[0]}")
-                        if step > 100 and torch.abs(previous_loss - loss) < 1e-10:
-                            print("Early stopping loss difference is smaller than 1e-10")
-                            break
-                        previous_loss = loss.clone()
+                    model = training_loop(optimizer, model, scheduler, num_steps, show_progress=PRINT)
 
                     # Save the model state.
                     torch.save(model.state_dict(), save_path_depth_ckpts + "parameters.ckpt")
