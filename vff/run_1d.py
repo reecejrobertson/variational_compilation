@@ -1,8 +1,6 @@
 import torch
 from torch import optim
 
-from vff.utils.training import training_loop
-
 CUDA_ENABLED = torch.cuda.is_available()
 print(f"Is GPU available? {CUDA_ENABLED}")
 if CUDA_ENABLED:
@@ -22,19 +20,15 @@ import warnings
 
 warnings.simplefilter("ignore", UserWarning)
 
-from utils.plot_utils import plot_losses
+from misc.plot import plot_losses
 from typing import Iterable
 # Everything here is based on QUIMB and PyTorch
+from tn.hamiltonians import get_hamiltonian
+from training.utils import training_loop
 from tn.mps_circuit import TNModel, qmps_brick, qmps_brick_quasi_1d, create_targets, load_gates
 from tn.data_states import random_product_state, \
     random_mps_state, get_make_data_set_fn, random_U1_state
-from tn.tebd import ising_hamiltonian_quimb, \
-    longitudinal_ising_hamiltonian_quimb, \
-    heisenberg_hamiltonian_quimb, \
-    mbl_hamiltonian_quimb
-from tn.trotter import trotter_evolution_optimized_nn_ising_tn, \
-    trotter_evolution_optimized_nn_heisenberg_tn, trotter_evolution_optimized_nn_mbl_tn, \
-    compress_trotterization_into_circuit, trotter_evolution_optimized_ising_nnn_tn
+from tn.trotter import compress_trotterization_into_circuit
 from tn.hst import hst
 # For next-nearest neighbors we use Tenpy
 import quimb.tensor as qtn
@@ -52,14 +46,13 @@ def main(config):
     TEST_UNITARY = config['TEST_UNITARY']
     HST = config.get('HST', False)
     SCRATCH_PATH = config.get('SCRATCH_PATH', None)
-    test_size = config.get('test_size', 100)
-    tebd_test_steps = config.get('tebd_test_steps', 20)
     SEED = config['SEED']
     torch.manual_seed(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
     GET_PATH = config.get('GET_PATH', False)
 
+    test_size = config.get('test_size', 100)
     # Model properties
     if 'L' in config.keys():
         L = config['L']
@@ -72,73 +65,7 @@ def main(config):
     trotter_start = config.get('trotter_start', False)
     trotter_start_order = config.get('trotter_start_order', 1)
     # assert
-
-    if hamiltonian == 'ising':
-        g = config.get('g', 1.0)
-        H = lambda x: ising_hamiltonian_quimb(x, 1.0, g)
-        hamiltonian_path = f"{hamiltonian}_g_{g:1.2f}"
-        trotter_initialization = lambda s, d: trotter_evolution_optimized_nn_ising_tn(L, 1.0, g, 0.0,
-                                                                                      s / d,
-                                                                                      d,
-                                                                                      p=trotter_start_order)
-        get_Utrotter = lambda s: trotter_evolution_optimized_nn_ising_tn(L, 1.0, g, 0.0, s / tebd_test_steps,
-                                                                         tebd_test_steps, p=2)
-    elif hamiltonian == 'longitudinal_ising':
-        jx = config.get('jx', 1.0)
-        jz = config.get('jz', 1.0)
-        H = lambda x: longitudinal_ising_hamiltonian_quimb(x, 1.0, jz, jx)
-        hamiltonian_path = f"{hamiltonian}_jz_{jz:1.2f}_jx_{jx:1.2f}"
-        trotter_initialization = lambda s, d: trotter_evolution_optimized_nn_ising_tn(L, 1.0, jz, jx,
-                                                                                      s / d,
-                                                                                      d,
-                                                                                      p=trotter_start_order)
-        get_Utrotter = lambda s: trotter_evolution_optimized_nn_ising_tn(L, 1.0, jz, jx, s / tebd_test_steps,
-                                                                         tebd_test_steps, p=2)
-    elif hamiltonian == 'heisenberg':
-        H = lambda x: heisenberg_hamiltonian_quimb(x)
-        hamiltonian_path = f"{hamiltonian}"
-        trotter_initialization = lambda s, d: trotter_evolution_optimized_nn_heisenberg_tn(L,
-                                                                                           s / d,
-                                                                                           d,
-                                                                                           p=trotter_start_order)
-        get_Utrotter = lambda s: trotter_evolution_optimized_nn_heisenberg_tn(L, s / tebd_test_steps,
-                                                                              tebd_test_steps, p=2)
-    elif hamiltonian == 'heisenberg_2d':
-        bc = config.get('boundary_condition', (False, False))
-        H = lambda x: (Lx, Ly, bc)
-        bc_str = ('_closed_Lx' if bc[0] else '') + ('_closed_Ly' if bc[1] else '')
-        hamiltonian_path = f"{hamiltonian}/{Lx}x{Ly}{bc_str}"
-        trotter_initialization = lambda s, d: NotImplementedError
-        get_Utrotter = lambda s: NotImplementedError
-        assert not trotter_start, 'Trotter start not possible for 2D models'
-
-    elif hamiltonian == 'mbl':
-        sigma = config.get('sigma', 1.0)
-        delta = config.get('delta', 1.0)
-        dh = (2.0 * np.random.rand(L) - 1.0) * sigma
-        H = lambda x: mbl_hamiltonian_quimb(x, delta, dh)
-        hamiltonian_path = f"{hamiltonian}_sigma_{sigma:1.3f}"
-        trotter_initialization = lambda s, d: trotter_evolution_optimized_nn_mbl_tn(L, delta, dh,
-                                                                                    s / d,
-                                                                                    d,
-                                                                                    p=trotter_start_order)
-        get_Utrotter = lambda s: trotter_evolution_optimized_nn_mbl_tn(L, delta, dh, s / tebd_test_steps,
-                                                                       tebd_test_steps, p=2)
-    elif hamiltonian == 'ising_nnn':
-        J = config.get('J', -1.0)
-        V = config.get('V', 1.0)
-        # define the model, notice the extra factor of 4 and 2
-        # assert not L % 2, "Number of sites must be even for NNN Ising"
-
-        trotter_initialization = lambda s, d: trotter_evolution_optimized_ising_nnn_tn(L, J, V,
-                                                                                       s / d,
-                                                                                       d,
-                                                                                       p=trotter_start_order)
-        H = lambda x: (x, J, V)
-        hamiltonian_path = f"{hamiltonian}_J_{J:1.3f}_V_{V:1.3f}"
-
-    else:
-        raise NotImplementedError
+    L, H, hamiltonian_path, trotter_initialization, get_Utrotter, bc = get_hamiltonian(config)
     if PRINT:
         print(f"Model {hamiltonian} of size {L} at time {t:1.3f}\n")
     granularity_from_t = int(np.round(t / 0.05))
@@ -626,7 +553,7 @@ def main(config):
             for i, t_i in enumerate(times):
                 print(f"Training for t={t_i:1.3f}")
                 save_path_t_i = save_path + f't_{t_i:1.3f}/'
-                save_path_t_i_previous = save_path + f't_{times[i-1]:1.3f}/'
+                save_path_t_i_previous = save_path + f't_{times[i - 1]:1.3f}/'
                 if not os.path.exists(save_path_t_i):
                     os.makedirs(save_path_t_i)
                 # Create or Load Train data
@@ -692,7 +619,11 @@ def main(config):
                     print(f"Start loss = {model.forward():1.12f}")
 
                     lr = learning_rate
-                    optimizer = optim.Adam(model.parameters(), lr=lr)
+                    if i==0:
+                        optimizer = optim.Adam(model.parameters(), lr=lr)
+                    else:
+                        optimizer = optim.SGD(model.parameters(), lr=lr)
+
                     scheduler = learning_rate_scheduler(optimizer)
 
                     model = training_loop(optimizer, model, scheduler, num_steps, show_progress=PRINT)
